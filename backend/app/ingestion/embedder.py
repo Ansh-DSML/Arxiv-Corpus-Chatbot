@@ -4,27 +4,25 @@ Dual-model embedder for text (BGE-M3) and images (ColPali).
 Both models are **lazily loaded** — memory is allocated only on the first
 call, not at import time.  Optimised for CPU execution.
 
-**BGE-M3** supports up to **8192 tokens** (vs 512 for BGE-large), so
-parent chunks (1024 tokens) are never truncated.  It also produces
-**native learned sparse vectors** — far superior to raw term-frequency
-counting.
+**BGE-M3** supports up to **8192 tokens**, so parent chunks (1024 tokens)
+are never truncated.
 
 Usage:
     from app.ingestion.embedder import TextEmbedder, VisualEmbedder
 
     te = TextEmbedder()
-    dense, sparse = te.embed_batch_hybrid(["hello world"])
-    # dense:  list[list[float]]  (1024-dim)
-    # sparse: list[SparseVector]
+    vecs  = te.embed_batch(["hello world"])        # -> list[list[float]]  (1024-dim)
+    sparse = te.compute_sparse_vectors(["hello"])  # -> list[SparseVector]
 
     ve = VisualEmbedder()
-    mvecs = ve.embed_single(base64_str)   # -> list[list[float]]  (N×128-dim)
+    mvecs = ve.embed_single(base64_str)            # -> list[list[float]]  (N×128-dim)
 """
 
 from __future__ import annotations
 
 import base64
 import io
+from collections import Counter
 
 import torch
 from PIL import Image
@@ -37,100 +35,95 @@ logger = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Text Embedder (BGE-M3  →  1024-dim dense + learned sparse)
+# Text Embedder (BGE-M3  →  1024-dim dense + sparse)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TextEmbedder:
-    """Encodes text with BGE-M3 and produces dense + sparse vectors.
-
-    BGE-M3 key specs:
-    * Max sequence length: **8192 tokens**
-    * Dense dimension:     **1024**
-    * Sparse output:       **learned lexical weights** (not raw TF)
-    """
+    """Encodes text with BGE-M3 and produces dense + sparse vectors."""
 
     def __init__(self, model_name: str = settings.EMBEDDING_MODEL) -> None:
         self._model_name = model_name
-        self._model = None   # BGEM3FlagModel (lazy)
+        self._model = None          # SentenceTransformer (lazy)
+        self._tokenizer = None      # HF tokenizer (lazy, for sparse)
 
-    # ---- lazy loader ---------------------------------------------------
+    # ---- lazy loaders --------------------------------------------------
 
     def _load_model(self):
         if self._model is not None:
             return
-        logger.info("Loading BGE-M3 text embedding model: {m}", m=self._model_name)
-        from FlagEmbedding import BGEM3FlagModel
+        logger.info("Loading text embedding model: {m}", m=self._model_name)
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(self._model_name)
+        self._model.eval()
+        logger.info("Text embedding model loaded (dim={d})", d=self._model.get_sentence_embedding_dimension())
 
-        self._model = BGEM3FlagModel(
-            self._model_name,
-            use_fp16=False,          # float32 for CPU
-        )
-        logger.info(
-            "BGE-M3 loaded (dense=1024-dim, sparse=learned lexical, max_tokens=8192)"
-        )
+    def _load_tokenizer(self):
+        if self._tokenizer is not None:
+            return
+        logger.info("Loading tokenizer for sparse vectors: {m}", m=self._model_name)
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+        logger.info("Tokenizer loaded (vocab_size={v})", v=self._tokenizer.vocab_size)
 
-    # ---- hybrid encoding (dense + sparse in ONE forward pass) ----------
-
-    def embed_batch_hybrid(
-        self,
-        texts: list[str],
-        batch_size: int = settings.TEXT_EMBED_BATCH_SIZE,
-    ) -> tuple[list[list[float]], list[SparseVector]]:
-        """Encode *texts* and return **(dense_vectors, sparse_vectors)**.
-
-        A single forward pass produces both dense (1024-dim, normalised)
-        and sparse (learned lexical weights) representations.
-        """
-        if not texts:
-            return [], []
-
-        self._load_model()
-
-        output = self._model.encode(
-            texts,
-            batch_size=batch_size,
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,    # not needed for this pipeline
-        )
-
-        # Dense: numpy array (N, 1024) → list[list[float]]
-        dense_vectors = output["dense_vecs"].tolist()
-
-        # Sparse: list of dicts {token_id: learned_weight}
-        sparse_vectors: list[SparseVector] = []
-        for lexical_dict in output["lexical_weights"]:
-            if not lexical_dict:
-                sparse_vectors.append(SparseVector(indices=[], values=[]))
-                continue
-            indices = [int(k) for k in lexical_dict.keys()]
-            values = [float(v) for v in lexical_dict.values()]
-            sparse_vectors.append(SparseVector(indices=indices, values=values))
-
-        return dense_vectors, sparse_vectors
-
-    # ---- convenience methods (backward-compatible) ---------------------
+    # ---- dense embeddings ----------------------------------------------
 
     def embed_batch(
         self,
         texts: list[str],
         batch_size: int = settings.TEXT_EMBED_BATCH_SIZE,
     ) -> list[list[float]]:
-        """Dense-only encoding. Prefer ``embed_batch_hybrid`` to avoid
-        running the model twice."""
-        dense, _ = self.embed_batch_hybrid(texts, batch_size)
-        return dense
+        """Encode *texts* to 1024-dim normalised dense vectors.
+
+        No instruction prefix is added — this is for **document** encoding.
+        Query prefixes are handled at retrieval time.
+        """
+        if not texts:
+            return []
+
+        self._load_model()
+
+        embeddings = self._model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        return embeddings.tolist()
 
     def embed_single(self, text: str) -> list[float]:
-        """Convenience: encode a single text (dense only)."""
+        """Convenience: encode a single text."""
         result = self.embed_batch([text], batch_size=1)
         return result[0] if result else []
 
+    # ---- sparse vectors (for Qdrant hybrid BM25) -----------------------
+
     def compute_sparse_vectors(self, texts: list[str]) -> list[SparseVector]:
-        """Sparse-only encoding. Prefer ``embed_batch_hybrid`` to avoid
-        running the model twice."""
-        _, sparse = self.embed_batch_hybrid(texts)
-        return sparse
+        """Compute BM25-style sparse vectors using the BGE tokeniser.
+
+        Each subword token ID becomes a sparse dimension; the value is the
+        term frequency (TF).  Qdrant applies IDF weighting at query time via
+        ``Modifier.IDF`` on the sparse vector config.
+        """
+        if not texts:
+            return []
+
+        self._load_tokenizer()
+
+        sparse_vectors: list[SparseVector] = []
+        for text in texts:
+            token_ids = self._tokenizer.encode(text, add_special_tokens=False)
+            if not token_ids:
+                sparse_vectors.append(SparseVector(indices=[], values=[]))
+                continue
+
+            counts = Counter(token_ids)
+            indices = list(counts.keys())
+            values = [float(v) for v in counts.values()]
+
+            sparse_vectors.append(SparseVector(indices=indices, values=values))
+
+        return sparse_vectors
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -151,15 +144,19 @@ class VisualEmbedder:
         if self._model is not None:
             return
         logger.info("Loading ColPali model: {m} (this may take a few minutes on CPU)", m=self._model_name)
-        try:
-            from colpali_engine.models import ColPali, ColPaliProcessor
+        from colpali_engine.models import ColPali, ColPaliProcessor
 
+        # Load processor
+        self._processor = ColPaliProcessor.from_pretrained(self._model_name)
+
+        # Load model — use bfloat16 to halve memory usage (prevents OOM on CPU)
+        try:
             self._model = ColPali.from_pretrained(
                 self._model_name,
-                torch_dtype=torch.float32,    # float32 for CPU
-            ).eval()
-
-            self._processor = ColPaliProcessor.from_pretrained(self._model_name)
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+            )
+            self._model.eval()
             logger.info("ColPali model loaded successfully")
         except Exception as exc:
             logger.error(

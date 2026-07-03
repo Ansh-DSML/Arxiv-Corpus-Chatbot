@@ -436,11 +436,12 @@ class IngestionPipeline:
             for chunk in all_chunks
         ]
 
-        # 4. Embed texts (dense + sparse in one forward pass via BGE-M3)
+        # 4. Embed texts (dense)
         texts = [p.text for p in payloads]
-        dense_vectors, sparse_vectors = self._text_embedder.embed_batch_hybrid(
-            texts, batch_size=settings.TEXT_EMBED_BATCH_SIZE
-        )
+        dense_vectors = self._text_embedder.embed_batch(texts, batch_size=settings.TEXT_EMBED_BATCH_SIZE)
+
+        # 5. Compute sparse vectors (BM25)
+        sparse_vectors = self._text_embedder.compute_sparse_vectors(texts)
 
         # 6. Build Qdrant points
         text_points: list[PointStruct] = []
