@@ -55,6 +55,7 @@ def _rasterise_page(pdf_path: Path, page_number: int, dpi: int = 300) -> Image.I
             last_page=page_number,
             dpi=dpi,
             fmt="png",
+            poppler_path=settings.POPPLER_PATH,
         )
         return images[0] if images else None
     except Exception as exc:

@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     SEMANTIC_CACHE_TTL_SECONDS: int = 86400
 
     # ── Embeddings ──────────────────────────────────────────
-    EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
     COLPALI_MODEL: str = "vidore/colpali-v1.2"
     HF_TOKEN: str = ""
 
@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     VISUAL_EMBED_BATCH_SIZE: int = 1  # images per ColPali call (CPU)
     QDRANT_UPLOAD_BATCH_SIZE: int = 64
     PDF_DPI: int = 300                # resolution for pdf2image rasterisation
+    POPPLER_PATH: str = r"C:\poppler\poppler-26.02.0\Library\bin"
 
     # ── Derived paths ───────────────────────────────────────
     @property
